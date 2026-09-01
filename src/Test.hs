@@ -1,7 +1,15 @@
 -- Created by Nicholas Bisset 2025
 module Test where
 
-import Process
+import Control.Concurrent.Async (withAsync)
+import Control.Concurrent.STM (atomically, newTBQueue, readTBQueue)
+import Control.Monad (forever)
+import Data.Aeson (encode)
+import qualified Data.ByteString.Lazy.Char8 as BL
+
+import Process (fetchDataFrom)
+import Threading (safePrint)
+import Types (RepositoryData)
 
 url1 :: String
 url1 = "https://github.com/Densetsu152637/test_repo_for_3170"
@@ -13,15 +21,12 @@ testApi :: IO ()
 testApi = do
   result <- processUrl url2
   case result of
-    Just repoData -> BL.putStrLn (encode repoData)
-    Nothing       -> safePrint "No repository data found."
+    Right repoData -> BL.putStrLn (encode repoData)
+    Left failure -> safePrint failure
 
 -- Process the URL and return repository data
-processUrl :: String -> IO (Maybe RepositoryData)
+processUrl :: String -> IO (Either String RepositoryData)
 processUrl repoUrl = do
   notifier <- atomically $ newTBQueue 1000
-
-  _ <- forkIO $ forever $ atomically (readTBQueue notifier) >>= safePrint
-
-  -- Main work
-  fetchDataFrom repoUrl notifier
+  withAsync (forever $ atomically (readTBQueue notifier) >>= safePrint) $ \_ ->
+    fetchDataFrom repoUrl notifier

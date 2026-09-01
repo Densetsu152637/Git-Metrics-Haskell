@@ -9,13 +9,11 @@ module Api (
 ) where
 
 import Network.Wai
-import Network.Wai.Handler.WebSockets (websocketsOr)
 import Network.WebSockets
   ( acceptRequest
   , receiveData
   , sendTextData
   , sendClose
-  , defaultConnectionOptions
   , ServerApp
   )
 
@@ -34,8 +32,6 @@ import Data.Text (Text)
 import Data.Char (isSpace)
 import GHC.Generics
 import qualified Data.ByteString.Lazy as BL
-import qualified Data.ByteString as BS
-import Data.ByteString.Lazy.Char8()
 
 import Control.Concurrent.STM (atomically, newTBQueue, readTBQueue)
 import Control.Concurrent.Async (withAsync)

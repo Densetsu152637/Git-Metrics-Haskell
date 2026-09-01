@@ -8,6 +8,9 @@
 module Threading (
   safePrint,
   emit,
+  AwaitBatch,
+  newAwaitBatch,
+  awaitBatched,
   WorkerPool(..),
   createThreadPool,
   submit,
@@ -29,28 +32,70 @@ module Threading (
 
 import Control.Concurrent.STM (
   atomically,
+  modifyTVar',
+  newEmptyTMVar,
   newTQueueIO,
+  newTVarIO,
+  isFullTBQueue,
+  putTMVar,
+  readTMVar,
   readTQueue,
+  readTVar,
   writeTQueue,
   TQueue,
+  TMVar,
+  TVar,
   writeTBQueue,
   TBQueue )
 import Control.Concurrent
-    ( forkIO,
-      MVar,
-      withMVar,
-      newMVar,
+    ( MVar,
+      ThreadId,
       forkIO,
       newEmptyMVar,
+      withMVar,
+      newMVar,
       putMVar,
-      takeMVar,
-      ThreadId )
-import Control.Monad (forever, forM, replicateM_, join, void)
+      readMVar )
+import Control.Monad (forever, forM, join, unless, void)
 import System.IO.Unsafe (unsafePerformIO)
 import System.IO (hFlush, stdout)
 import Control.DeepSeq (force)
 import Control.Exception
-    (SomeException, evaluate, handle, try, throwIO)
+    (SomeException, evaluate, handle, mask, try, throwIO)
+import qualified Data.Map.Strict as Map
+
+-- | Registry of currently running actions. Callers using the same key share
+-- the result of one action; completed actions are not cached.
+newtype AwaitBatch key value = AwaitBatch
+  (TVar (Map.Map key (TMVar (Either SomeException value))))
+
+newAwaitBatch :: IO (AwaitBatch key value)
+newAwaitBatch = AwaitBatch <$> newTVarIO Map.empty
+
+-- | Run at most one action for a key at a time. The first caller is the leader
+-- and every concurrent follower awaits the same broadcast result. Exceptions
+-- are broadcast too, and the key is always removed so a later call can retry.
+awaitBatched :: Ord key => AwaitBatch key value -> key -> IO value -> IO value
+awaitBatched (AwaitBatch active) key action = mask $ \restore -> do
+  (isLeader, resultVar) <- atomically $ do
+    batches <- readTVar active
+    case Map.lookup key batches of
+      Just existing -> pure (False, existing)
+      Nothing -> do
+        created <- newEmptyTMVar
+        modifyTVar' active (Map.insert key created)
+        pure (True, created)
+
+  if isLeader
+    then do
+      outcome <- try (restore action)
+      atomically $ do
+        putTMVar resultVar outcome
+        modifyTVar' active (Map.delete key)
+      either throwIO pure outcome
+    else do
+      outcome <- restore (atomically (readTMVar resultVar))
+      either throwIO pure outcome
 
 -- ThreadPool abstraction
 data WorkerPool = WorkerPool
@@ -73,7 +118,11 @@ safePrint msg = withMVar stdoutLock $ \_ -> do
 emit :: TBQueue String -> String -> IO ()
 emit q msg = do
   res <- evaluate (force msg)
-  atomically $ writeTBQueue q res
+  -- Progress updates must never stall the underlying repository job when a
+  -- client is slow or disconnected. The final value travels separately.
+  atomically $ do
+    full <- isFullTBQueue q
+    unless full $ writeTBQueue q res
 
 await :: IO (IO a) -> IO a
 await = join
@@ -84,10 +133,11 @@ wrapped = pure
 -- Create a thread pool with N worker threads
 createThreadPool :: Int -> String -> IO WorkerPool
 createThreadPool n name = do
+  let workerCount = max 1 n
   q <- newTQueueIO
-  tids <- forM [0 .. n - 1] $ \i ->
+  tids <- forM [0 .. workerCount - 1] $ \i ->
     forkIO $ workerLoop i q
-  pure $ WorkerPool n tids name q
+  pure $ WorkerPool workerCount tids name q
 
 -- Worker loop that never dies: catches exceptions from tasks and ignores them,
 -- then continues looping.
@@ -97,22 +147,22 @@ workerLoop idx q = forever $ do
   handle (\(_ :: SomeException) -> pure ()) (void $ task idx)
 
 -- Submit a task to the pool, returning an IO that produces the result.
--- The returned IO, when executed (takeMVar), will re-throw the exception
+-- The returned IO, when executed, will re-throw the exception
 -- if the task failed, or return the successful value.
 submitIndexed :: WorkerPool -> (Int -> IO a) -> IO (IO a)
 submitIndexed (WorkerPool _ _ _ queue) action = do
   resultVar <- newEmptyMVar :: IO (MVar (Either SomeException a))
-  -- Wrap the action with 'catch' to always put something in resultVar
-  let wrappedAction idx = do
-        r <- try (action idx >>= evaluate)
-        putMVar resultVar r
+  -- Mask the publication gap so cancellation can never leave an empty future.
+  let wrappedAction idx = mask $ \restore -> do
+        outcome <- try (restore (action idx >>= evaluate))
+        putMVar resultVar outcome
   atomically $ writeTQueue queue wrappedAction
-  -- Return IO that rethrows exceptions or returns value
-  return $ do
-    e <- takeMVar resultVar
-    case e of
+  -- readMVar makes a submitted future safe to await more than once.
+  pure $ do
+    outcome <- readMVar resultVar
+    case outcome of
       Left ex -> throwIO ex
-      Right v -> return v
+      Right value -> pure value
 
 -- Fallback version: ignores index
 submit :: WorkerPool -> IO a -> IO (IO a)

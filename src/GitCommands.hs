@@ -16,7 +16,6 @@ module GitCommands (
 ) where
 
 import Command
-import Control.Concurrent.STM ( TBQueue )
 
 quote :: String -> String
 quote s = "\"" ++ s ++ "\""

@@ -22,11 +22,11 @@ module Command (
 import System.Exit (ExitCode(..))
 import System.Environment (getEnvironment)
 import System.Timeout (timeout)
-import System.IO ()
 import Control.Monad (when, forM_)
 import Control.Concurrent.STM (TBQueue)
-import Control.Exception (evaluate, SomeException (SomeException), try, catch)
+import Control.Exception (IOException, SomeException, catch, throwIO, try)
 import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (concurrently)
 import System.Directory
     ( copyFile,
       createDirectoryIfMissing,
@@ -34,13 +34,12 @@ import System.Directory
       getDirectoryContents,
       removeDirectoryRecursive ) 
 import System.Process
-    ( createProcess,
-      shell,
+    ( shell,
       waitForProcess,
+      withCreateProcess,
       CreateProcess(env, cwd, std_out, std_err),
       StdStream(CreatePipe) )
 import System.FilePath ((</>))
-import Control.DeepSeq (force)
 
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
@@ -107,45 +106,48 @@ executeCommand notifier filepath f = do
             , env = procEnv
             }
 
-      (_, Just hout, Just herr, phandle) <- createProcess processSpec
+      withCreateProcess processSpec $ \_ maybeOut maybeErr phandle ->
+        case (maybeOut, maybeErr) of
+          (Just hout, Just herr) -> do
+            -- Drain both pipes concurrently. Reading either one first can
+            -- deadlock when the child fills the other pipe's OS buffer.
+            (rawOutBS, rawErrBS) <- concurrently
+              (BS.hGetContents hout)
+              (BS.hGetContents herr)
 
-      -- Read raw bytes
-      rawOutBS <- BS.hGetContents hout
-      rawErrBS <- BS.hGetContents herr
+            let stdoutText = T.unpack (TE.decodeUtf8With TEE.lenientDecode rawOutBS)
+                stderrText = T.unpack (TE.decodeUtf8With TEE.lenientDecode rawErrBS)
 
-      -- Decode as UTF-8, but replace invalid sequences with U+FFFD
-      let stdout_txt = T.unpack (TE.decodeUtf8With TEE.lenientDecode rawOutBS)
-          stderr_txt = T.unpack (TE.decodeUtf8With TEE.lenientDecode rawErrBS)
+            exitCode <- waitForProcess phandle
+            case exitCode of
+              ExitFailure code -> do
+                let commandError =
+                      "Process exited with code "
+                        ++ show code
+                        ++ " from path: "
+                        ++ filepath
+                        ++ ":\n"
+                        ++ onFail f rawCmd stderrText
+                when (shouldLog f) $ emit notifier commandError
+                pure $ CommandResult stdoutText (Just commandError)
+                  (if null stderrText then Nothing else Just stderrText)
 
-      exitCode <- waitForProcess phandle
-
-      case exitCode of
-        ExitFailure code -> do
-          let errMsg =
-                "Process exited with code "
-                  ++ show code
-                  ++ " from path: "
-                  ++ filepath
-                  ++ ":\n"
-                  ++ onFail f rawCmd stderr_txt
-          when (shouldLog f) $ emit notifier errMsg
-          pure $ CommandResult stdout_txt (Just errMsg) (if null stderr_txt then Nothing else Just stderr_txt)
-
-        ExitSuccess ->
-          if null stderr_txt
-            then do
-              when (shouldLog f) $
-                emit notifier (onSuccess f rawCmd stdout_txt)
-              pure $ CommandResult stdout_txt Nothing Nothing
-            else do
-              when (shouldLog f) $ do
-                let stdErrMsg = "stderr:\n" ++ onStdFail f rawCmd stdout_txt stderr_txt
-                emit notifier stdErrMsg
-              pure $ CommandResult stdout_txt Nothing (Just stderr_txt)
+              ExitSuccess ->
+                if null stderrText
+                  then do
+                    when (shouldLog f) $
+                      emit notifier (onSuccess f rawCmd stdoutText)
+                    pure $ CommandResult stdoutText Nothing Nothing
+                  else do
+                    when (shouldLog f) $ do
+                      let stdErrMessage = "stderr:\n" ++ onStdFail f rawCmd stdoutText stderrText
+                      emit notifier stdErrMessage
+                    pure $ CommandResult stdoutText Nothing (Just stderrText)
+          _ -> ioError $ userError "executeCommand: failed to create stdout/stderr pipes"
 
 executeCommandTimedOut :: Int -> TBQueue String -> FilePath -> Command -> IO CommandResult
 executeCommandTimedOut seconds notifier filepath cmd = do
-  let micros = seconds * (10^6)
+  let micros = seconds * 1000000
   mres <- timeout micros (executeCommand notifier filepath cmd)
   case mres of
     Just res -> pure res
@@ -173,15 +175,15 @@ deleteDirectoryIfExists dir f = do
   where
     retryDelete :: Int -> Maybe SomeException ->  IO Bool
     -- failed case
-    retryDelete 0 e = error $ "Failed to delete directory \"" ++ dir ++ "\": " ++ show e
-    retryDelete n e = do
-      result <- try (removeDirectoryRecursive dir) :: IO (Either SomeException ())
-      case result of
+    retryDelete 0 previousError =
+      throwIO $ userError $ "Failed to delete directory \"" ++ dir ++ "\": " ++ show previousError
+    retryDelete n _ = do
+      deletion <- try (removeDirectoryRecursive dir) :: IO (Either SomeException ())
+      case deletion of
         Right _ -> pure True
-        Left e  -> do
-          -- safePrint $ "Retry " ++ show (4 - n) ++ " failed to delete " ++ dir ++ ": " ++ show e
-          threadDelay 1000000  -- wait 1 seconds
-          retryDelete (n - 1) $ Just e
+        Left deletionError -> do
+          threadDelay 1000000
+          retryDelete (n - 1) $ Just deletionError
 
 -- | Recursively copy one directory to another, including hidden files like `.git`.
 copyDirectory :: FilePath -> FilePath -> IO ()
@@ -195,6 +197,6 @@ copyDirectory src dst = do
         isDir <- doesDirectoryExist srcPath
         if isDir
            then copyDirectory srcPath dstPath
-           else copyFile srcPath dstPath `catch` \(e :: SomeException) ->
-                    safePrint $ "Failed to copy " ++ srcPath ++ " to " ++ dstPath ++ ": " ++ show e
+           else copyFile srcPath dstPath `catch` \(copyError :: IOException) ->
+                    safePrint $ "Failed to copy " ++ srcPath ++ " to " ++ dstPath ++ ": " ++ show copyError
     

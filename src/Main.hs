@@ -6,25 +6,23 @@
 
 module Main (main) where
 
-import Control.Exception (bracket)
-import System.Environment (getEnvironment, setEnv, unsetEnv)
-import Control.Concurrent (forkIO, getNumCapabilities)
+import System.Environment (setEnv, unsetEnv)
 import GHC.Conc (getNumProcessors, setNumCapabilities)
 
 import Network.Wai.Handler.WebSockets (websocketsOr)
-import Network.WebSockets.Connection
-  ( ConnectionOptions(..), defaultConnectionOptions )
+import Network.WebSockets.Connection (defaultConnectionOptions)
 import Network.Wai.Handler.Warp
-  ( runSettings, defaultSettings, setPort, setHost, Settings
-  , runSettingsSocket
-  )
+  ( runSettings, defaultSettings, setPort, setHost, Settings )
 
 #if !defined(mingw32_HOST_OS)
+import Control.Concurrent.Async (concurrently_)
+import Control.Exception (bracket)
 import Network.Socket
   ( socket, bind, listen, Socket, SockAddr(SockAddrUnix)
   , Family(AF_UNIX), SocketType(Stream)
   , close
   )
+import Network.Wai.Handler.Warp (runSettingsSocket)
 #endif
 
 import Api
@@ -43,19 +41,16 @@ cleanEnvironment = do
 
     pure ()
 
-socketPath :: String
+#if !defined(mingw32_HOST_OS)
+socketPath :: FilePath
 socketPath = "/tmp/haskell-ipc.sock"
+#endif
 
 -- | Initialize the runtime to use all logical cores
 initializeRuntime :: IO ()
 initializeRuntime = do
     cores <- getNumProcessors
     setNumCapabilities cores
-    cap <- getNumCapabilities
-
-    -- initialise the thread pools used for parsing + running commands
-    let t1 = parsingPool
-    let t2 = commandPool
 
     -- worker thread pools should be ready for use
     -- safePrint $ "number of cores available for use: " ++ show cores
@@ -66,8 +61,8 @@ initializeRuntime = do
 
 main :: IO ()
 main = do
-    init <- initializeRuntime
-    awaitEnvironmentClean <- cleanEnvironment
+    initializeRuntime
+    cleanEnvironment
 
     -- Enable permessage-deflate (RSV1 frames allowed)
     let opts = defaultConnectionOptions  -- no connectionCompression
@@ -78,10 +73,10 @@ main = do
     runSettings tcpSettings app
 #else
     -- On Unix: TCP + Unix socket
-    _ <- forkIO $ runSettings tcpSettings app
-
     bracket (setupUnixSocket socketPath) close $ \unixSock ->
-        runSettingsSocket defaultSettings unixSock app
+        concurrently_
+            (runSettings tcpSettings app)
+            (runSettingsSocket defaultSettings unixSock app)
 #endif
 
 -- TCP Settings

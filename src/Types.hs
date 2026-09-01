@@ -15,10 +15,9 @@ module Types (
 ) where
 
 import Data.Map.Strict (Map)
-import Data.Time (UTCTime)
-import GHC.Generics 
-import Data.Aeson 
-import Data.Aeson.Types (defaultOptions, SumEncoding(..))
+import GHC.Generics
+import Data.Aeson
+import Control.DeepSeq (NFData)
 
 -- | Represents the full repository data
 data RepositoryData = RepositoryData
@@ -26,12 +25,12 @@ data RepositoryData = RepositoryData
   , branches     :: [BranchData]
   , allCommits   :: Map String CommitData
   , contributors :: Map String ContributorData
-  } deriving (Show, Eq, Generic, ToJSON, FromJSON)
+  } deriving (Show, Eq, Generic, ToJSON, FromJSON, NFData)
 
 data BranchData = BranchData
   { branchName   :: String
   , commitHashes :: [String]
-  } deriving (Show, Eq, Generic, ToJSON, FromJSON)
+  } deriving (Show, Eq, Generic, ToJSON, FromJSON, NFData)
 
 data CommitData = CommitData
   { commitHash      :: String
@@ -40,12 +39,12 @@ data CommitData = CommitData
   , description     :: String
   , timestamp       :: String
   , fileData        :: [FileChanges]
-  } deriving (Show, Eq, Generic, ToJSON, FromJSON)
+  } deriving (Show, Eq, Generic, ToJSON, FromJSON, NFData)
 
 data ContributorData = ContributorData
   { name :: String
   , emails           :: [String]
-  } deriving (Show, Eq, Generic, ToJSON, FromJSON)
+  } deriving (Show, Eq, Generic, ToJSON, FromJSON, NFData)
 
 data FileChanges = FileChanges
   { filepath     :: String
@@ -55,11 +54,11 @@ data FileChanges = FileChanges
   , newLines     :: Int
   , deletedLines :: Int
   , diff         :: [String]
-  } deriving (Show, Eq, Generic, ToJSON, FromJSON)
+  } deriving (Show, Eq, Generic, ToJSON, FromJSON, NFData)
 
 -- | Change types: A = Added, M = Modified, D = Deleted, R = Renamed, C = Copied
 data ChangeType = A | M | D | R | C
-  deriving (Show, Eq, Ord, Generic, ToJSON, FromJSON, Read)
+  deriving (Show, Eq, Ord, Generic, ToJSON, FromJSON, Read, NFData)
 
 getChangeType :: Char -> Maybe ChangeType
 getChangeType 'A' = Just A

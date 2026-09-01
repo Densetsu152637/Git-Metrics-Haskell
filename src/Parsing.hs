@@ -30,8 +30,6 @@ module Parsing (
 import Text.Read (readMaybe)
 import Data.List (isPrefixOf, isSuffixOf, nub, dropWhileEnd, intercalate)
 import Data.Char (isSpace, toLower)
-import Data.Time (UTCTime)
-import Data.Time.Format (parseTimeM, defaultTimeLocale)
 import Control.Applicative (Alternative, empty, (<|>))
 import Text.Regex.Posix ((=~))
 import qualified Data.Map.Strict as Map
@@ -89,19 +87,17 @@ successful (CommandResult res _          (Just stdErr)) =
   if failedOutput stdErr || failedOutput res then Error stdErr else Result res
 successful (CommandResult res _          _            ) = Result res
 
-parsed :: String -> ParseResult a -> a
-parsed _   (Result r)  = r
-parsed ""  (Error "")  = error "Got blank string"
-parsed ""  (Error msg) = error msg
-parsed msg (Error e)   = error msg 
---                     = error msg 
---                     = error $ msg ++ ":\n" ++ e
+parsed :: String -> ParseResult a -> IO a
+parsed _ (Result parsedValue) = pure parsedValue
+parsed "" (Error "") = ioError $ userError "Got blank string"
+parsed "" (Error msg) = ioError $ userError msg
+parsed msg (Error parseError) = ioError $ userError $ msg ++ ":\n" ++ parseError
 
-parsedLists :: String -> [ParseResult a] -> [a]
-parsedLists msg = map (parsed msg)
+parsedLists :: String -> [ParseResult a] -> IO [a]
+parsedLists msg = mapM (parsed msg)
 
-parsedNestedLists :: String -> [[ParseResult a]] -> [[a]]
-parsedNestedLists msg = map (parsedLists msg)
+parsedNestedLists :: String -> [[ParseResult a]] -> IO [[a]]
+parsedNestedLists msg = mapM (parsedLists msg)
 
 toLowerString :: String -> String
 toLowerString = map toLower
@@ -179,17 +175,18 @@ data InbetweenCommitData = InbetweenCommitData
 
 parseCommitData :: String -> ParseResult InbetweenCommitData
 parseCommitData txt
-  | failedOutput txt  = Error txt
-  | length blocks < 6 = Error ("has less than 6 blocks: \"" ++ show blocks ++ "\" | txt: \"" ++ txt ++ "\"")
-  | otherwise = do
-      return InbetweenCommitData
-        { ibCommitHash      = trim $ blocks !! 0
-        , ibContributorName = trim $ blocks !! 1
-        , ibTimestamp       = trim $ blocks !! 2
-        , ibCommitTitle     = trim $ blocks !! 3
-        , ibDescription     = trim $ blocks !! 4
-        , involvedFiles     = parseFileLines (drop 5 blocks)
+  | failedOutput txt = Error txt
+  | otherwise = case blocks of
+      commitHashBlock:authorBlock:timestampBlock:titleBlock:descriptionBlock:fileBlocks@(_:_) ->
+        pure InbetweenCommitData
+        { ibCommitHash      = trim commitHashBlock
+        , ibContributorName = trim authorBlock
+        , ibTimestamp       = trim timestampBlock
+        , ibCommitTitle     = trim titleBlock
+        , ibDescription     = trim descriptionBlock
+        , involvedFiles     = parseFileLines fileBlocks
         }
+      _ -> Error ("has less than 6 blocks: \"" ++ show blocks ++ "\" | txt: \"" ++ txt ++ "\"")
   where
     blocks = splitOn1 delim txt
     trim   = intercalate "\n" . map (dropWhile isSpace) . lines
@@ -207,9 +204,9 @@ data MetaFileChanges = MetaFileChanges
 parseFileDataFromCommit :: [String] -> ParseResult MetaFileChanges
 parseFileDataFromCommit dataList =
   case dataList of
-    (changeStr:rest) -> do
-      -- first char is status (A,M,D,R,C), remainder may be percentage for R/C (e.g. "R100")
-      let (changeChar:likenessStr) = changeStr
+    ((changeChar:likenessStr):rest) -> do
+      -- First char is status (A,M,D,R,C); the remainder may be a
+      -- percentage for R/C (for example, "R100").
       changeTy <- maybeToResult ("Invalid change type: " ++ [changeChar]) (getChangeType changeChar)
 
       newFilePathTxt <- maybeToResult "Missing new file path" (lastElem rest)
@@ -232,6 +229,7 @@ parseFileDataFromCommit dataList =
         , charM        = changeTy
         , likenessM    = likenessInt
         }
+    ("":_) -> Error "Missing change type"
     _ -> Error $ "Malformed dataList: " ++ show dataList
 
 -- Diff record
@@ -314,9 +312,9 @@ mergeFileMetaData = map (
 
 -- Helpers
 splitOn1 :: Eq a => [a] -> [a] -> [[a]]
-splitOn1 delim = go
+splitOn1 separator = go
   where
-    go s = case breakList delim s of
+    go s = case breakList separator s of
       Just (before, after) -> before : go after
       Nothing              -> [s]
 
@@ -335,11 +333,14 @@ first :: (a -> b) -> (a, c) -> (b, c)
 first f (x, y) = (f x, y)
 
 split :: Eq a => a -> [a] -> [[a]]
-split delim = foldr f [[]]
+split separator = go
   where
-    f c acc@(x:xs)
-      | c == delim = []:acc
-      | otherwise  = (c:x):xs
+    go [] = [[]]
+    go (x:xs)
+      | x == separator = [] : go xs
+      | otherwise = case go xs of
+          current:rest -> (x:current) : rest
+          [] -> [[x]]
 
 isInfixOf :: Eq a => [a] -> [a] -> Bool
 isInfixOf needle haystack = any (needle `isPrefixOf`) (tails haystack)
@@ -349,8 +350,7 @@ tails []       = [[]]
 tails x@(_:xs) = x : tails xs
 
 lastElem :: [a] -> Maybe a
-lastElem [] = Nothing
-lastElem xs = Just (last xs)
+lastElem = foldl (\_ value -> Just value) Nothing
 
 cleanGitUrl :: String -> String
 cleanGitUrl url
