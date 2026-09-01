@@ -1,0 +1,8 @@
+.git
+.github
+.stack-work
+dist
+dist-*
+*.hi
+*.o
+Dockerfile*
