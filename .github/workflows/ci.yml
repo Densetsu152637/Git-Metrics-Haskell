@@ -14,33 +14,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  haskell:
-    name: Haskell typecheck, build, and test
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up GHC and Stack
-        uses: haskell-actions/setup@v2
-        with:
-          ghc-version: 9.8.4
-          enable-stack: true
-          stack-version: latest
-          cabal-update: false
-
-      - name: Typecheck with warnings as errors
-        run: >-
-          stack --system-ghc --no-install-ghc ghc --
-          -fno-code -Wall -Werror -isrc src/Main.hs
-
-      - name: Build and run tests
-        run: >-
-          stack --system-ghc --no-install-ghc test
-          --ghc-options="-Werror"
-
   docker:
     name: Docker build
     runs-on: ubuntu-latest

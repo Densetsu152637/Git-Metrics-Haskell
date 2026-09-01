@@ -28,7 +28,7 @@ FROM debian:bullseye-slim
 
 # Install runtime libraries only. Development headers belong in the builder.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates git libgmp10 && \
+    apt-get install -y --no-install-recommends ca-certificates curl git libgmp10 && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
