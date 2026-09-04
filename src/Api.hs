@@ -9,21 +9,17 @@ module Api (
 ) where
 
 import Network.Wai
-import Network.WebSockets
-  ( acceptRequest
-  , receiveData
-  , sendTextData
-  , sendClose
-  , ServerApp
-  )
+import qualified Network.WebSockets as WS
 
 import Network.HTTP.Types
   ( status200
   , status400
+  , status401
   , status405
   , status500
   , methodGet
   , methodPost
+  , Header
   )
 
 import Data.Aeson
@@ -32,22 +28,53 @@ import Data.Text (Text)
 import Data.Char (isSpace)
 import GHC.Generics
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as B8
 
 import Control.Concurrent.STM (atomically, newTBQueue, readTBQueue)
 import Control.Concurrent.Async (withAsync)
 import Control.Monad (forever, void)
+import System.Environment (lookupEnv)
 
 import Process (fetchDataFrom)
 import Types ()
 import Threading (safePrint)
+import Security (apiKeyAuthorized)
+
+maxRequestBytes :: Int
+maxRequestBytes = 8192
+
+headersAuthorized :: [Header] -> IO Bool
+headersAuthorized headers = do
+  configured <- lookupEnv "GIT_API_TOKEN"
+  pure $ apiKeyAuthorized (B8.pack <$> configured)
+    (lookup "X-Git-Api-Key" headers)
+
+readLimitedBody :: Request -> IO (Either Text BL.ByteString)
+readLimitedBody request = go 0 []
+  where
+    go total chunks = do
+      chunk <- getRequestBodyChunk request
+      if BS.null chunk
+        then pure (Right (BL.fromChunks (reverse chunks)))
+        else
+          let nextTotal = total + BS.length chunk
+          in if nextTotal > maxRequestBytes
+             then pure (Left "Request body is too large.")
+             else go nextTotal (chunk : chunks)
 
 ------------------------------------------------------------
 -- Incoming JSON
 ------------------------------------------------------------
-data ClientMessage = ClientMessage { url :: String }
-  deriving (Show, Generic)
+data ClientMessage = ClientMessage
+  { url :: String
+  , authToken :: Maybe String
+  }
+  deriving (Generic)
 
-instance FromJSON ClientMessage
+instance FromJSON ClientMessage where
+  parseJSON = withObject "ClientMessage" $ \value ->
+    ClientMessage <$> value .: "url" <*> value .:? "auth_token"
 
 encodeValue :: ToJSON a => Text -> a -> BL.ByteString
 encodeValue label val = encode $ object ["type" .= label, "data" .= val]
@@ -62,34 +89,45 @@ trim = f . f
 ------------------------------------------------------------
 -- 📡 WebSocket Handler
 ------------------------------------------------------------
-appWS :: ServerApp
+appWS :: WS.ServerApp
 appWS pendingConn = do
-  conn <- acceptRequest pendingConn
+  authorized <- headersAuthorized (WS.requestHeaders (WS.pendingRequest pendingConn))
+  if not authorized
+    then WS.rejectRequest pendingConn "Unauthorized"
+    else handleAuthorizedWebSocket pendingConn
 
-  msg <- receiveData conn
-  case eitherDecode (BL.fromStrict msg) of
+handleAuthorizedWebSocket :: WS.ServerApp
+handleAuthorizedWebSocket pendingConn = do
+  conn <- WS.acceptRequest pendingConn
+
+  msg <- WS.receiveData conn
+  if BS.length msg > maxRequestBytes
+    then do
+      WS.sendTextData conn $ encodeError "Request body is too large."
+      WS.sendClose conn ("Bad input" :: Text)
+    else case eitherDecode (BL.fromStrict msg) of
     Left _ -> do
-      sendTextData conn $ encodeError "Invalid JSON format. Expected: {\"url\": \"...\"}"
-      sendClose conn ("Bad input" :: Text)
+      WS.sendTextData conn $ encodeError "Invalid JSON format. Expected: {\"url\": \"...\"}"
+      WS.sendClose conn ("Bad input" :: Text)
 
-    Right (ClientMessage repoUrl) -> do
-      safePrint $ "Processing URL (WS): " ++ repoUrl
+    Right (ClientMessage repoUrl repositoryAuthToken) -> do
+      safePrint "Processing authenticated repository request (WS)."
       notifier <- atomically $ newTBQueue 1000
 
       -- Stream text_update messages while job runs
       withAsync (forever $ do
           update <- atomically $ readTBQueue notifier
-          sendTextData conn (BL.toStrict $ encodeValue "text_update" update)
+          WS.sendTextData conn (BL.toStrict $ encodeValue "text_update" update)
         ) $ \_ -> do
 
-        result <- fetchDataFrom (trim repoUrl) notifier
+        result <- fetchDataFrom (trim repoUrl) repositoryAuthToken notifier
         case result of
-          Right repoData -> sendTextData conn (BL.toStrict $ encodeValue "value" repoData)
+          Right repoData -> WS.sendTextData conn (BL.toStrict $ encodeValue "value" repoData)
           Left errmsg    -> do
-            sendTextData conn (BL.toStrict $ encodeValue "text_update" errmsg)
-            sendTextData conn (BL.toStrict $ encodeError (T.pack ("err: " ++ errmsg)))
+            WS.sendTextData conn (BL.toStrict $ encodeValue "text_update" errmsg)
+            WS.sendTextData conn (BL.toStrict $ encodeError (T.pack ("err: " ++ errmsg)))
 
-      sendClose conn ("Done" :: Text)
+      WS.sendClose conn ("Done" :: Text)
 
 ------------------------------------------------------------
 -- 🌐 HTTP Fallback Handler (POST only)
@@ -98,29 +136,38 @@ fallback :: Application
 fallback req respond =
   if requestMethod req == methodGet && pathInfo req == ["health"]
     then respond $ responseLBS status200 [("Content-Type", "application/json")] "{\"status\":\"ok\"}"
-    else if requestMethod req /= methodPost
-    then respond $ responseLBS status405 [("Content-Type", "text/plain")] "Method Not Allowed"
     else do
-      body <- strictRequestBody req
-      case eitherDecode body of
-        Left _ ->
-          respond $ responseLBS status400 [("Content-Type", "application/json")]
-                    $ encodeError "Invalid JSON format. Expected: {\"url\": \"...\"}"
+      authorized <- headersAuthorized (requestHeaders req)
+      if not authorized
+        then respond $ responseLBS status401 [("Content-Type", "application/json")]
+              $ encodeError "Unauthorized."
+        else if requestMethod req /= methodPost
+          then respond $ responseLBS status405 [("Content-Type", "text/plain")] "Method Not Allowed"
+          else do
+            bodyResult <- readLimitedBody req
+            case bodyResult of
+              Left bodyError ->
+                respond $ responseLBS status400 [("Content-Type", "application/json")]
+                          $ encodeError bodyError
+              Right body -> case eitherDecode body of
+                Left _ ->
+                  respond $ responseLBS status400 [("Content-Type", "application/json")]
+                            $ encodeError "Invalid JSON format. Expected: {\"url\": \"...\"}"
 
-        Right (ClientMessage repoUrl) -> do
-          safePrint $ "Processing URL (HTTP): " ++ repoUrl
-          notifier <- atomically $ newTBQueue 1000
+                Right (ClientMessage repoUrl repositoryAuthToken) -> do
+                  safePrint "Processing authenticated repository request (HTTP)."
+                  notifier <- atomically $ newTBQueue 1000
 
-          -- Discard updates, but ensure worker cleaned up
-          withAsync (forever $ void (atomically (readTBQueue notifier))) $ \_ -> do
-            result <- fetchDataFrom (trim repoUrl) notifier
-            case result of
-              Right repoData ->
-                respond $ responseLBS status200 [("Content-Type", "application/json")]
-                          $ encodeValue "value" repoData
-              Left errmsg -> do
-                respond $ responseLBS status500 [("Content-Type", "application/json")]
-                          $ encodeError (T.pack ("err: " ++ errmsg))
+                  -- Discard updates, but ensure worker cleaned up
+                  withAsync (forever $ void (atomically (readTBQueue notifier))) $ \_ -> do
+                    result <- fetchDataFrom (trim repoUrl) repositoryAuthToken notifier
+                    case result of
+                      Right repoData ->
+                        respond $ responseLBS status200 [("Content-Type", "application/json")]
+                                  $ encodeValue "value" repoData
+                      Left errmsg -> do
+                        respond $ responseLBS status500 [("Content-Type", "application/json")]
+                                  $ encodeError (T.pack ("err: " ++ errmsg))
 
 ------------------------------------------------------------
 -- Exported HTTP app

@@ -27,12 +27,22 @@ Both methods require you to send a payload of some sorts. This payload should be
 https://github.com/<OWNER>/<REPOSITORY_NAME>
 ```
 
-If your repo is public, you have nothing to worry about! It should work automatically.
-However, if your repo is private, the request may time out and give you an error because git did not have permission to clone the repo. To fix this, ensure that you are providing an access key inside your payload, which will help git authentication to approve cloning the repo! The general format for such a payload is the following (using https as an example):
+Only HTTPS repository URLs on `GIT_ALLOWED_HOSTS` are accepted. URLs containing
+credentials, custom ports, query strings, or fragments are rejected. Do not put
+private-repository credentials in a URL: URLs can otherwise leak through errors,
+proxies, Git remotes, and logs.
 
-```
-https://<YOUR_USERNAME>:<YOUR_PRIVATE_KEY>@github.com/<OWNER>/<REPOSITORY_NAME>
-```
+The optional `auth_token` request field supplies a per-request HTTPS Git token
+for a private repository. Use a short-lived, read-only token with access only to
+the requested repository. The service passes it to Git through a temporary
+credential-helper environment and does not store it in the remote URL or command
+arguments. Authenticated checkouts and in-flight request batches are isolated by
+a SHA-256 token fingerprint, so a request without the token cannot join or reuse
+an authenticated request for the same repository. The raw token is never used as
+a directory name.
+
+All analysis requests must also include `X-Git-Api-Key` with the configured
+`GIT_API_TOKEN`. `GET /health` is the only unauthenticated application endpoint.
 
 # How our code interfaces with the API
 
@@ -43,8 +53,11 @@ We can interface with the api using code like this:
 ```
 fetch("http://" + API_CONN_ENDPOINT, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-Git-Api-Key": GIT_API_TOKEN,
+        },
+        body: JSON.stringify({ url, auth_token }),
     }).then((response) => {
         if (!response.ok) reject(`Haskell API returned status ${response.status}`);
         response.json().then((d) => resolve(d.data));
@@ -55,6 +68,10 @@ Things to note:
 the method should always be POST, otherwise the API will reject the request
 
 # WebSockets
+
+The WebSocket upgrade request must include `X-Git-Api-Key`. Browser WebSocket
+APIs cannot set arbitrary upgrade headers, so browser code must connect through
+an authenticated server-side proxy. Never expose `GIT_API_TOKEN` to a browser.
 
 Websockets can get a little complicated, so bear with me.
 For every new repository you want analytics on, you must create a new Socket each time:
@@ -74,8 +91,9 @@ socket.onopen = () => {
     // send data through socket
     socket.send(
         JSON.stringify({
-        url,
-    })
+          url,
+          auth_token,
+        })
     );
 };
 ```

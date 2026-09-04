@@ -29,4 +29,4 @@ processUrl :: String -> IO (Either String RepositoryData)
 processUrl repoUrl = do
   notifier <- atomically $ newTBQueue 1000
   withAsync (forever $ atomically (readTBQueue notifier) >>= safePrint) $ \_ ->
-    fetchDataFrom repoUrl notifier
+    fetchDataFrom repoUrl Nothing notifier

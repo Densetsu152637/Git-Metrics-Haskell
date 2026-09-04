@@ -34,7 +34,7 @@ import System.Directory
       getDirectoryContents,
       removeDirectoryRecursive ) 
 import System.Process
-    ( shell,
+    ( proc,
       waitForProcess,
       withCreateProcess,
       CreateProcess(env, cwd, std_out, std_err),
@@ -49,7 +49,8 @@ import qualified Data.Text.Encoding.Error as TEE
 import Threading
 
 data Command = Command
-  { command    :: String
+  { executable :: FilePath
+  , arguments  :: [String]
   , env_vars   :: Maybe [(String, String)]
   , env_clean  :: [String]
   , onSuccess  :: String -> String -> String
@@ -79,7 +80,7 @@ defaultStdFail :: String -> String -> String -> String
 defaultStdFail c _ se = "Command:\n" ++ c ++ "\nError:\n" ++ se
 
 logData :: Command
-logData = Command "" Nothing [] defaultSuccess defaultFail defaultStdFail True
+logData = Command "" [] Nothing [] defaultSuccess defaultFail defaultStdFail True
 
 doNotLogData :: Command
 doNotLogData = logData { shouldLog = False }
@@ -90,7 +91,7 @@ executeCommand notifier filepath f = do
   if not valid
     then pure $ CommandResult "" (Just $ "Invalid filepath: " ++ filepath) Nothing
     else do
-      let rawCmd = command f
+      let rawCmd = unwords (executable f : map show (arguments f))
       baseEnv <- getEnvironment
       let procEnv =
             case env_vars f of
@@ -99,7 +100,7 @@ executeCommand notifier filepath f = do
                 let cleanedEnv = filter (\(k,_) -> k `notElem` env_clean f) baseEnv
                 Just (cleanedEnv ++ extra)
 
-      let processSpec = (shell rawCmd)
+      let processSpec = (proc (executable f) (arguments f))
             { cwd = Just filepath
             , std_out = CreatePipe
             , std_err = CreatePipe
@@ -155,7 +156,7 @@ executeCommandTimedOut seconds notifier filepath cmd = do
       let errMsg =
             "Process timed out after "
               ++ show micros ++ "μs "
-              ++ "for command: " ++ command cmd
+            ++ "for command: " ++ unwords (executable cmd : map show (arguments cmd))
               ++ " in path: " ++ filepath
       when (shouldLog cmd) $
         emit notifier errMsg

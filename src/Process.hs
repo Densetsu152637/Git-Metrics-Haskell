@@ -25,7 +25,6 @@ import Control.Exception (
     onException,
     throwIO)
 import Control.DeepSeq (force)
-import Data.Char (isAlphaNum, toLower)
 import Data.List (sortBy, isPrefixOf)
 import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
@@ -49,6 +48,13 @@ import Threading
 import Command
 import GitCommands
 import Parsing
+import Security
+  ( RepositoryTarget(..)
+  , configuredAllowedHosts
+  , repositoryAccessPath
+  , validateAuthToken
+  , validateRepositoryUrl
+  )
 
 -- Create global thread pools
 -- Initialize RTS and return pools
@@ -181,31 +187,40 @@ execAndParseAll notifier cwd cmds parser msg =
         parsed msg (parser rawOutput))
     cmds
 
-fetchDataFrom :: String -> TBQueue String -> IO (Either String RepositoryData)
-fetchDataFrom rawUrl notifier =
-    let url = cleanGitUrl rawUrl
-        batchKey = either (const url) id (repositoryRelativePath url)
-    in awaitBatched repositoryRequestBatch batchKey (fetchDataFromUnbatched url notifier)
+fetchDataFrom :: String -> Maybe String -> TBQueue String -> IO (Either String RepositoryData)
+fetchDataFrom rawUrl rawAuthToken notifier = do
+    allowedHosts <- configuredAllowedHosts
+    case (validateRepositoryUrl allowedHosts rawUrl, validateAuthToken rawAuthToken) of
+        (_, Left validationError) -> do
+            emit notifier validationError
+            pure (Left validationError)
+        (Left validationError, _) -> do
+            emit notifier validationError
+            pure (Left validationError)
+        (Right target, Right authToken) ->
+            awaitBatched repositoryRequestBatch
+                (repositoryAccessPath authToken target)
+                (fetchDataFromUnbatched target authToken notifier)
 
-fetchDataFromUnbatched :: String -> TBQueue String -> IO (Either String RepositoryData)
-fetchDataFromUnbatched url notifier = (do
+fetchDataFromUnbatched :: RepositoryTarget -> Maybe String -> TBQueue String -> IO (Either String RepositoryData)
+fetchDataFromUnbatched target authToken notifier = (do
 
         workingDir <- getTemporaryDirectory
-        repoRelativePath <- either (ioError . userError) pure (repositoryRelativePath url)
         let cloneRoot = workingDir </> "cloned-repos"
-            repoAbsPath = cloneRoot </> repoRelativePath
+            repoAbsPath = cloneRoot </> repositoryAccessPath authToken target
+            url = repositoryUrl target
 
         createDirectoryIfMissing True cloneRoot
         emit notifier "Validating repo exists..."
 
         let execCmdInWorkingDir = execAndParse notifier workingDir
-        _ <- execCmdInWorkingDir (checkIfRepoExists url) parseRepoExists "Repo does not exist"
+        _ <- execCmdInWorkingDir (checkIfRepoExists url authToken) parseRepoExists "Repo does not exist"
 
         emit notifier "Found the repo!"
 
         let initializeDirectory = createDirectory repoAbsPath $ \_ -> do
                 emit notifier "Cloning repo..."
-                commandResult <- executeCommandTimedOut 10 notifier cloneRoot (cloneRepo url repoAbsPath)
+                commandResult <- executeCommandTimedOut 10 notifier cloneRoot (cloneRepo url repoAbsPath authToken)
                 void $ parsed "Failed to clone the repo" $ successful commandResult
 
                 ensureSuccess <- executeCommand notifier repoAbsPath (checkIsGitDirectory repoAbsPath)
@@ -314,30 +329,6 @@ formulateRepoData _url path notifier = do
         branchData
         commitMap
         contributorMap
-
--- | Utility
-splitOn :: Eq a => a -> [a] -> [[a]]
-splitOn separator = go []
-  where
-    go acc [] = [reverse acc]
-    go acc (x:xs)
-      | x == separator = reverse acc : go [] xs
-      | otherwise  = go (x:acc) xs
-
-repositoryRelativePath :: String -> Either String FilePath
-repositoryRelativePath url =
-    case reverse (filter (not . null) (splitOn '/' url)) of
-        repository:owner:authority:_
-            | all validSegment [host, owner, repository] ->
-                Right (map toLower host </> owner </> repository)
-            | otherwise -> Left "Repository host, owner, or name contains unsafe path characters"
-          where
-            host = reverse (takeWhile (/= '@') (reverse authority))
-        _ -> Left "Repository URL must contain a host, owner, and repository name"
-  where
-    validSegment segment =
-        segment `notElem` [".", ".."]
-            && all (\character -> isAlphaNum character || character `elem` ("-_." :: String)) segment
 
 unique :: Ord a => [a] -> [a]
 unique = Map.keys . Map.fromList . flip zip (repeat ())

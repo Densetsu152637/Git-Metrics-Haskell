@@ -28,6 +28,7 @@ import Network.Wai.Handler.Warp (runSettingsSocket)
 import Api
 import Process
 import Threading
+import Security (validateSecurityConfiguration)
 
 cleanEnvironment :: IO ()
 cleanEnvironment = do
@@ -61,6 +62,7 @@ initializeRuntime = do
 
 main :: IO ()
 main = do
+    validateSecurityConfiguration
     initializeRuntime
     cleanEnvironment
 
