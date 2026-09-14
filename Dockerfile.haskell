@@ -24,7 +24,7 @@ RUN stack --system-ghc --no-install-ghc build \
       --copy-bins --local-bin-path /out
 
 # -------- Runtime Stage --------
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 # Install runtime libraries only. Development headers belong in the builder.
 RUN apt-get update && \
