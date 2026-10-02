@@ -30,17 +30,17 @@ git -C "<new-worktree-path>" status --short --branch
 
 ## Branches and commits
 
-| Change | Branch prefix | Commit type |
-| --- | --- | --- |
-| Feature | `feat/` | `feat` |
-| Fix | `fix/` | `fix` |
-| Temporary work | `temp/` | `temp` (local convention) |
-| Maintenance | `chore/` | `chore` |
-| Documentation | `docs/` | `docs` |
-| Formatting | `style/` | `style` |
-| Refactor | `refactor/` | `refactor` |
-| Tests | `test/` | `test` |
-| CI | `ci/` | `ci` |
+| Change         | Branch prefix | Commit type               |
+| -------------- | ------------- | ------------------------- |
+| Feature        | `feat/`       | `feat`                    |
+| Fix            | `fix/`        | `fix`                     |
+| Temporary work | `temp/`       | `temp` (local convention) |
+| Maintenance    | `chore/`      | `chore`                   |
+| Documentation  | `docs/`       | `docs`                    |
+| Formatting     | `style/`      | `style`                   |
+| Refactor       | `refactor/`   | `refactor`                |
+| Tests          | `test/`       | `test`                    |
+| CI             | `ci/`         | `ci`                      |
 
 - Use a short descriptive branch suffix, for example `feat/login-page`. Follow a required host prefix if one exists. Do not rename an existing user branch merely to satisfy this convention.
 - Use `<type>(<optional-scope>): <imperative summary>`, for example `fix(auth): reject expired tokens`. Mark breaking changes with `!` and describe their impact in the body.
